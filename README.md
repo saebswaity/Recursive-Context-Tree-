@@ -1,6 +1,8 @@
 # Recursive Context Tree: A Pattern for AI-Assisted Development
 
-**The problem:** AI coding agents (Claude Code, Cursor, Copilot, etc.) have a fixed context window. They can't remember previous sessions. Every time you start a new conversation, the AI knows nothing about your project.
+> **Who this is for:** Teams working on medium-to-large codebases (5+ modules, multiple developers, frontend + backend) where AI agents regularly lose track of project context between sessions. If your project fits in a single CLAUDE.md under 100 lines, you probably don't need this — just write a good root file and move on. This pattern pays off when your project is too big for a single context file but too complex to go without any context at all.
+
+**The problem:** AI coding agents (Claude Code, Cursor, Copilot, etc.) have a fixed context window. They can't remember previous sessions. Every time you start a new conversation, the AI knows nothing about your project. The bigger your project, the worse this gets — a 50-module monolith can't fit in any context window.
 
 **The common mistake:** Developers dump massive documentation into the context — architecture reports, changelogs, implementation histories. This wastes tokens on information the AI doesn't need for the current task, and the important details get lost in noise.
 
@@ -23,7 +25,41 @@ At any point, the AI has maybe 130-200 lines of context loaded — not 10,000. T
 
 ---
 
+## When to Use This (and When Not To)
+
+This pattern has a setup cost. Before investing, check whether your project actually needs it.
+
+### Use the full two-tree pattern when:
+
+- Your project has **5+ distinct modules** with clear boundaries (auth, payments, orders, etc.)
+- Multiple developers (or AI agents) work on different parts of the codebase
+- You have both frontend and backend (or multiple services)
+- AI sessions regularly fail because the agent doesn't understand module interactions
+- You're doing multi-session refactors where decisions need to survive between sessions
+
+### Use a single CLAUDE.md (skip the rest) when:
+
+- Your project is small enough that one file can describe the whole thing in ~100 lines
+- You're the only developer and you can verbally remind the AI what it needs
+- The codebase is a single service with straightforward structure
+- You're prototyping and the architecture is still changing daily
+
+### Scale gradually — don't over-engineer on day one:
+
+| Project size | What you need |
+|---|---|
+| Small (1-3 modules) | One `CLAUDE.md` at the root. That's it. |
+| Medium (4-8 modules) | Root `CLAUDE.md` + `docs/ai/` with module READMEs (Tree 2 only) |
+| Large (9+ modules, multi-team) | Full two-tree pattern with subdirectory rules and maintenance automation |
+| Monorepo / multi-service | Two-tree pattern + per-service roots with cross-service dependency maps |
+
+Start with the smallest version that solves your problem. You can always add layers later.
+
+---
+
 ## Two Trees, Two Purposes
+
+> **Note:** This is the full pattern for large projects. If you're at the "medium" scale (4-8 modules), you can skip Tree 1 entirely and just use Tree 2 (`docs/ai/`) with a single root `CLAUDE.md`. Add Tree 1 when your subdirectory conventions become complex enough to warrant per-directory rules.
 
 The pattern uses **two separate recursive trees** that work together:
 
@@ -293,6 +329,11 @@ Every module README follows the same format:
    - The AI's first question is always "which files do I need to read?"
    - Give it the answer upfront
 
+5. **A wrong doc is worse than no doc**
+   - If a README lists `services.py` but that file was renamed to `domain.py`, the AI will waste turns looking for a file that doesn't exist — or worse, create a duplicate
+   - When in doubt, delete stale sections rather than leaving them. A shorter, accurate doc beats a longer, partly-wrong one
+   - The `Last verified` date exists for this reason — if it's old, treat the doc as suspect
+
 ---
 
 ## The Session Checkpoint Pattern (Optional)
@@ -374,7 +415,7 @@ If work spans multiple sessions:
 
 ## Keeping Docs Fresh
 
-The biggest risk is docs going stale. There's no magic solution — but you can make it significantly easier.
+The biggest risk is docs going stale. Stale docs are arguably **worse than no docs** — the AI will confidently follow an outdated key-files table and produce code that doesn't integrate. This section takes staleness seriously.
 
 ### The Maintenance Rule
 
@@ -389,18 +430,40 @@ IMPORTANT: After completing any feature, bug fix, or significant change, you MUS
 2. If it exists: update it to reflect the CURRENT state
 3. If it doesn't exist: create it following the same format
 4. Keep each README under 120 lines
+5. Update the `Last verified:` date
 
 Format rule: write "what IS" not "what was done".
 This is not optional. Treat doc updates as part of task completion.
 ```
 
-### How well does this actually work?
+### Detecting Staleness Before It Hurts You
+
+The maintenance rule helps, but docs still drift. Use these strategies to catch it early:
+
+**1. The `Last verified` date is your first defense.** Every module README has one. If it's older than 2-3 weeks on an actively developed module, treat the doc as suspect. Add a periodic check to your workflow — weekly for active modules, monthly for stable ones.
+
+**2. Git-based staleness detection.** If files listed in a module's Key Files table have been modified more recently than the README itself, the README is likely stale. You can automate this:
+
+```bash
+# Quick staleness check: compare README date vs key files
+readme_date=$(git log -1 --format="%ai" docs/ai/payments/README.md)
+latest_code=$(git log -1 --format="%ai" backend/payments/)
+echo "README: $readme_date"
+echo "Code:   $latest_code"
+```
+
+**3. CI lint (optional but powerful).** For teams that want to enforce freshness, add a CI check that warns when a module's code files are modified in a PR but its `docs/ai/{module}/README.md` is not. This doesn't block the PR — it just reminds the developer.
+
+**4. Quarterly doc audit.** Schedule a 30-minute review every few weeks. For each module README: open the key files listed, scan for obvious mismatches (renamed files, removed functions, changed flows). This is the only reliable way to catch subtle drift.
+
+### How well does the AI-assisted approach actually work?
 
 **The AI drafts, you approve.** The maintenance rule causes the AI to update docs after most features — but the output needs human review. Common failure modes:
 
 - **Verbosity creep** — the AI adds bullets but never removes them. Files slowly grow past 120 lines.
 - **Dropped patterns** — the AI doesn't recognize which patterns are critical and quietly omits them during rewrites.
 - **Surface-level updates** — the AI updates "Current State" but misses that a key file was renamed or a flow changed.
+- **Phantom documentation** — the AI documents what it *planned* to build rather than what actually shipped. Always verify against the actual code.
 
 **What works in practice:**
 1. The rule gets the AI to *attempt* doc updates ~80% of the time — without it, the rate is near zero
@@ -449,15 +512,27 @@ Both approaches load context on-demand — neither dumps everything. The differe
 
 The win isn't just fewer tokens — it's fewer wasted turns and higher signal density per line loaded.
 
+> **Caveat:** These numbers come from one project type (a structured accounting platform with well-defined module boundaries). Your mileage will vary. Projects with blurry module boundaries, heavy cross-cutting concerns, or deeply nested service dependencies may see smaller gains — the tree structure works best when your code actually has a tree-like architecture. Highly interconnected systems (where every module touches every other module) may need a different approach, such as a dependency map at the index level that shows which modules to load together.
+
 ---
 
 ## Quick Start (Copy This)
 
+### If your project is small (1-3 modules):
+1. Create `CLAUDE.md` at your project root with your stack, rules, and key files
+2. You're done. Seriously. Don't add more until you feel the pain.
+
+### If your project is medium-to-large (4+ modules):
 1. Create `CLAUDE.md` at your project root (or equivalent for your tool)
 2. Create `docs/ai/README.md` with your module index
 3. For each major module, create `docs/ai/{module}/README.md`
 4. Add the doc-maintenance rule so docs stay fresh
 5. Tell your AI: "Read CLAUDE.md first" — or let it auto-load
+
+### If your project is large with distinct frontend/backend conventions (9+ modules):
+1. Do everything above
+2. Add subdirectory `CLAUDE.md` files for backend/ and frontend/ (Tree 1)
+3. Add `.claude/rules/` for always-on rules
 
 Start small. You don't need every module documented on day one. Document the module you're about to work on, and grow the tree organically.
 
@@ -489,9 +564,11 @@ Keep it under 120 lines. Write "what IS" not "what was done."
 | Feature-based, not layer-based | AI needs both frontend and backend together |
 | "What IS" not "what was done" | History is noise — current state is signal |
 | Keep files short (~120 lines) | If it's longer, split into deeper files |
+| Wrong docs are worse than no docs | Stale key-files tables actively mislead the AI |
 | AI-drafted, human-approved | Doc-maintenance rule + periodic review |
 | One universal folder (docs/ai/) | Works with any AI tool, any LLM |
 | Session checkpoints | Save state before context limit, resume later |
+| Scale to your project size | A single CLAUDE.md is fine for small projects — don't over-engineer |
 
 ### The Complete Flow
 
@@ -527,4 +604,4 @@ flowchart LR
     style F fill:#e9c46a,color:#000
 ```
 
-The AI doesn't need to understand your whole project. It needs to understand the part it's about to touch, in the fewest tokens possible.
+The AI doesn't need to understand your whole project. It needs to understand the part it's about to touch, in the fewest tokens possible. Start with the smallest version that works, and grow the tree as your project grows.
