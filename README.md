@@ -452,7 +452,7 @@ echo "README: $readme_date"
 echo "Code:   $latest_code"
 ```
 
-**3. CI lint (optional but powerful).** For teams that want to enforce freshness, add a CI check that warns when a module's code files are modified in a PR but its `docs/ai/{module}/README.md` is not. This doesn't block the PR — it just reminds the developer.
+**3. CI lint (optional but powerful).** For teams that want to enforce freshness, add a CI check that warns when a module's code files are modified in a PR but its `docs/ai/{module}/README.md` is not. This doesn't block the PR — it just reminds the developer. (For the related *reachability* check — catching docs nothing links to — see [The Reachability Problem](#the-reachability-problem-the-patterns-biggest-blind-spot) and [`tools/doc_graph.py`](./tools/doc_graph.py).)
 
 **4. Quarterly doc audit.** Schedule a 30-minute review every few weeks. For each module README: open the key files listed, scan for obvious mismatches (renamed files, removed functions, changed flows). This is the only reliable way to catch subtle drift.
 
@@ -472,6 +472,59 @@ echo "Code:   $latest_code"
 4. Periodic human review (every few weeks) catches the drift that the AI introduces
 
 This isn't fully automated documentation. It's AI-assisted documentation with a human in the loop. That's still dramatically better than manually maintaining docs, which in practice means not maintaining them at all.
+
+---
+
+## The Reachability Problem (the pattern's biggest blind spot)
+
+> This section comes from running the pattern in anger on a real 40-doc tree. It's the failure mode the rest of this README doesn't name — and the one most likely to silently waste your effort.
+
+The entire pattern rests on one assumption that is never stated as a rule: **every doc must be reachable by following links from an always-loaded entry point.** Only the root `CLAUDE.md` is auto-loaded. Everything else is found **exclusively by link-following**. So the moment you write a doc that nothing links to, it becomes invisible — not partially, *completely*. A navigating agent will never open it, never cite it, never know it exists.
+
+This is worse than staleness. A stale doc at least gets read (and misleads). An **orphan doc is never read at all** — you paid the full cost of writing it and get zero return. We coined the rule:
+
+> **An unreachable doc is worse than no doc.** A stale doc misleads; an orphan silently wastes the work that created it.
+
+### Why it happens so easily
+
+The pattern *invites* orphans. Every time you:
+- write a design proposal, an ADR, a "decided NOT to build" note, a migration plan, a report for a client →
+- …and don't add a link to it from a parent index →
+
+…you've created an orphan. These "decision/rejected-option" docs are exactly the high-value context the pattern is meant to preserve, and they're the ones most likely to be orphaned, because the "what IS" module README has no obvious slot for them. In our real tree, **every single orphan was a plan, proposal, or report** — never a module README.
+
+### What the pattern is missing
+
+The maintenance rule says "link new docs from an index" — but nothing **verifies** it. There's no defense against the link simply not being added. The fix is a mechanical reachability check, and it belongs in the same place as staleness detection:
+
+**A graph + orphan check.** Parse every link between docs, walk the graph from the entry file(s), and flag anything unreachable or any link that points at a missing file. This turns "will a future agent find this doc?" from something you must *remember to ask* into a one-command fact.
+
+This repo ships that check: [`tools/doc_graph.py`](./tools/doc_graph.py) (see [tools/README.md](./tools/README.md)). Zero dependencies. It:
+- computes reachability from **all** always-loaded entry points (root + `backend/` + `frontend/` `CLAUDE.md` — not just one; subdirectory CLAUDE.md files are auto-loaded too and are legitimate roots),
+- flags **orphans** (nothing links in), **unreachable** (island clusters that link to each other but not to a root), and **broken links**,
+- emits a **Mermaid** graph (renders on GitHub — commit it) and an **interactive HTML** (git-ignore it; regenerate locally),
+- has a `--check` mode for CI.
+
+```bash
+python3 tools/doc_graph.py            # regenerate graph + orphan report
+python3 tools/doc_graph.py --check    # exit 1 if any orphan/unreachable/broken (CI gate)
+```
+
+### Three sharp lessons from building it
+
+1. **The orphan check is also a *correctness* check for the tool itself.** Our first version reported `reachable=1` (everything orphaned) — a confidently wrong answer — because its link parser only understood `[](...)` links. Real docs navigate via **multiple link dialects**: standard links, folder-links (`[Items](./items/)` → `items/README.md`), **inline-backtick path citations** (`` `docs/ai/foo.md` `` in Key-Files tables — often the *dominant* style), and tool-specific `@imports`. A checker that misses a dialect manufactures false orphans. If you write your own, handle all the dialects your docs actually use, and **strip fenced code blocks first** so example links aren't counted as real edges.
+
+2. **Don't gate CI on the check until the tree is already clean.** A reachability gate that's red on day one (because you have a backlog of orphans) gets `|| true`'d into uselessness. Clean first, then gate — and ideally gate on *new* orphans (delta vs a committed baseline) rather than the absolute count.
+
+3. **The graph is a diagnostic, not decoration.** Its value isn't the pretty picture — it's the orphan list. Rendering the tree immediately surfaced 6 lost docs (plans and reports) and 1 broken folder-link that no amount of reading would have revealed.
+
+### Where decision-knowledge belongs
+
+The pattern's "what IS" framing has no home for "what we considered and rejected, and why." Two options, both better than an orphan:
+- **An always-loaded memory file** (e.g. the `memory/MEMORY.md` some tools load every session) for decisions that must survive regardless of navigation — no link-following required.
+- **An explicit "Under consideration / Decided against" section** in the relevant module or index README, with a link to the full proposal doc — so the decision is reachable.
+
+The established name for these is an **ADR (Architecture Decision Record)**. If you accumulate many, give them their own indexed folder (`docs/ai/decisions/`) linked from the root index — so they're reachable by construction.
 
 ---
 

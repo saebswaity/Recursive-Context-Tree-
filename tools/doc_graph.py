@@ -1,0 +1,486 @@
+#!/usr/bin/env python3
+"""
+doc_graph.py — render a Recursive Context Tree as a graph + flag orphans.
+
+Parses every link between .md files under a docs root, resolves relative
+paths, computes which files are reachable from the always-loaded entry
+file(s) (CLAUDE.md and any backend/ frontend/ CLAUDE.md), and flags:
+  - ORPHANS      files no other doc links to
+  - UNREACHABLE  files no navigating agent can reach by following links
+  - BROKEN       links whose target doesn't exist
+
+Emits two artifacts next to this script:
+  - doc_graph.md    Mermaid diagram (renders on GitHub, no tooling needed)
+  - doc_graph.html  Interactive force-graph (drag / zoom / click-to-open)
+
+Zero runtime deps for the report — pure stdlib. The HTML pulls d3 from a CDN.
+
+Usage (defaults assume this script lives in <repo>/tools/):
+    python3 tools/doc_graph.py                       # auto-detect docs root
+    python3 tools/doc_graph.py --docs docs/ai        # explicit docs root
+    python3 tools/doc_graph.py --no-html             # skip HTML (faster, CI)
+    python3 tools/doc_graph.py --check               # exit 1 on any problem (CI gate)
+    python3 tools/doc_graph.py --root /other/repo --docs /other/repo/docs \\
+            --entry /other/repo/CLAUDE.md            # run against another repo
+
+Why this exists: the Recursive Context Tree works ONLY if every doc is linked
+into the tree. An orphan is invisible to a navigating agent — it cost real
+work to write and returns nothing. This makes reachability a glanceable fact
+instead of something you must remember to verify, and gives the maintenance
+rule ("link new docs from an index") a mechanical enforcer.
+
+Recognized link dialects (a missing dialect = false orphans):
+  [label](./file.md)     standard markdown link
+  [label](./dir/)        folder-link  -> resolves to dir/README.md
+  `path/to/file.md`      inline-backtick path (the Key-Files citation style)
+  @path/to/file.md       @import (honored in CLAUDE.md files only)
+Links inside fenced code blocks and <!-- comments --> are ignored (examples).
+"""
+import os
+import re
+import sys
+import glob
+import json
+import argparse
+from collections import defaultdict, deque
+
+# --- config (defaults; all overridable via CLI flags) -----------------------
+# Default repo root = the parent of the dir holding this script (i.e. assumes
+# <repo>/tools/doc_graph.py). Override with --root for any other layout.
+DEFAULT_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+# Module-level handles, set by main() from args so other repos can point
+# the tool at a different docs root / entry file without editing the source.
+REPO_ROOT = DEFAULT_REPO_ROOT
+DOCS_ROOT = os.path.join(REPO_ROOT, "docs", "ai")
+# Always-loaded entry points an agent starts navigation from. Claude Code
+# auto-loads the root CLAUDE.md AND any backend/ frontend/ subdir CLAUDE.md,
+# so reachability must seed from ALL of them — a doc linked only from
+# backend/CLAUDE.md is genuinely findable (Searcher-2 finding #2).
+ENTRY_FILES = []  # filled by configure()
+OUT_DIR = os.path.dirname(__file__)
+
+# Files that are intentionally not linked (found by convention, not navigation).
+# Matched by basename — kept deliberately tiny. NOTE: `_progress.md` is NOT
+# whitelisted: the doc-maintenance rule requires deleting it when work
+# completes, so a lingering orphaned one is a real signal, not noise
+# (Searcher-2 finding #1).
+ALLOWED_ORPHANS = {
+    "TEMPLATE.md",        # stencil for new module docs
+    "doc_graph.md",       # this tool's own generated output
+}
+
+# Standard markdown link to a .md file:  [label](../foo/bar.md#anchor "title")
+LINK_RE = re.compile(r'\]\(\s*<?([^)\s>]+?\.md)(?:#[^)\s>]*)?>?(?:\s+"[^"]*")?\s*\)')
+# Folder-style link (resolves to that folder's README.md):  [Items](./items/)
+FOLDER_LINK_RE = re.compile(r'\]\(\s*<?(\.{1,2}/[^)\s>]*?/)(?:#[^)\s>]*)?>?\s*\)')
+# Claude Code @import syntax (only honored in CLAUDE.md files): @docs/ai/README.md
+IMPORT_RE = re.compile(r'(?:^|\s)@([\w./-]+\.md)\b')
+# Inline-backtick path citation:  `docs/ai/pot/foo.md`  — the DOMINANT citation
+# style in module Key-Files tables. A navigating agent reads these and opens
+# them, so they ARE navigation edges (Searcher-1 + Searcher-3 CRITICAL finding).
+# Only single-backtick inline spans; fenced ``` blocks are stripped first.
+BACKTICK_PATH_RE = re.compile(r'`([^`\n]*?\.md)(?:#[^`\n]*)?`')
+# Fenced code blocks (``` or ~~~). Stripped before parsing so EXAMPLE links
+# inside fences don't become phantom edges (Searcher-1 finding #2).
+FENCE_RE = re.compile(r'(^|\n)(```|~~~).*?(\n\2|\Z)', re.DOTALL)
+# HTML comments — also stripped (illustrative links live here too).
+COMMENT_RE = re.compile(r'<!--.*?-->', re.DOTALL)
+# Any inline single-backtick span. Used to strip code-shown link syntax like
+# `[x](./dir/)` so prose EXAMPLES of link syntax aren't counted as real edges.
+INLINE_CODE_RE = re.compile(r'`[^`\n]*`')
+
+
+def strip_fences(text: str) -> str:
+    """Remove fenced code blocks + HTML comments. Inline backtick spans are
+    KEPT here so backtick PATH citations can still be harvested first."""
+    text = FENCE_RE.sub("\n", text)
+    text = COMMENT_RE.sub("", text)
+    return text
+
+
+def rel(path: str) -> str:
+    """Repo-relative path for display."""
+    return os.path.relpath(path, REPO_ROOT)
+
+
+def collect():
+    """Return (files, edges, broken).
+
+    files: list of abs paths to every .md under DOCS_ROOT (+ the entry files)
+    edges: list of UNIQUE (src_abs, dst_abs) for every resolvable .md reference
+    broken: list of (src_abs, raw_link, resolved_missing_abs)
+
+    A "reference" is a standard [](.md) link, a folder-link ([](./dir/) →
+    dir/README.md), an inline-backtick `path.md` citation, or — in CLAUDE.md
+    files only — an @import. Fenced code blocks + HTML comments are stripped
+    first so example links inside them aren't counted.
+    """
+    files = sorted(glob.glob(os.path.join(DOCS_ROOT, "**", "*.md"), recursive=True))
+    for entry in ENTRY_FILES:
+        if os.path.exists(entry) and entry not in files:
+            files = [entry] + files
+
+    edge_set, broken = set(), []
+    fileset = set(files)
+
+    def add(f, raw, resolved):
+        """Record an edge or a broken link for a resolved target path."""
+        if os.path.exists(resolved):
+            if resolved in fileset:
+                edge_set.add((f, resolved))
+            # links to real files outside the doc set (e.g. source code) are
+            # neither edges-in-graph nor broken — silently ignore.
+        else:
+            broken.append((f, raw, resolved))
+
+    for f in files:
+        base = os.path.dirname(f)
+        try:
+            raw_text = open(f, encoding="utf-8").read()
+        except Exception:
+            continue
+        # Strip fenced blocks + comments. Keep inline backticks for now so
+        # backtick PATH citations can be harvested before we strip them.
+        text = strip_fences(raw_text)
+        is_claude_md = os.path.basename(f) == "CLAUDE.md"
+
+        # 1. inline-backtick `path.md` citations (Key-Files style) — harvested
+        #    FIRST, from text that still has its backticks. Resolve relative to
+        #    base, then repo-root (docs often cite full repo-relative paths).
+        for raw in BACKTICK_PATH_RE.findall(text):
+            if raw.startswith(("http://", "https://", "//")):
+                continue
+            cand_base = os.path.normpath(os.path.join(base, raw))
+            cand_repo = os.path.normpath(os.path.join(REPO_ROOT, raw))
+            if os.path.exists(cand_base) and cand_base in fileset:
+                edge_set.add((f, cand_base))
+            elif os.path.exists(cand_repo) and cand_repo in fileset:
+                edge_set.add((f, cand_repo))
+            # Bare path that doesn't resolve → NOT reported broken: backtick
+            # spans are also used for illustrative paths, so only count hits.
+
+        # Now strip ALL inline-code spans, so link syntax shown as code in
+        # prose — e.g. `[Items](./items/)` documenting the syntax — is not
+        # mistaken for a real link/folder edge (the example-link false positive).
+        text = INLINE_CODE_RE.sub(" ", text)
+
+        # 2. standard [label](path.md) links
+        for raw in LINK_RE.findall(text):
+            if raw.startswith(("http://", "https://", "//", "mailto:")):
+                continue
+            add(f, raw, os.path.normpath(os.path.join(base, raw)))
+
+        # 3. folder-style [label](./items/) → that folder's README.md
+        for raw in FOLDER_LINK_RE.findall(text):
+            if raw.startswith(("http://", "https://", "//")):
+                continue
+            add(f, raw, os.path.normpath(os.path.join(base, raw, "README.md")))
+
+        # 4. @import paths — ONLY in CLAUDE.md files, resolved from REPO_ROOT
+        if is_claude_md:
+            for raw in IMPORT_RE.findall(text):
+                add(f, raw, os.path.normpath(os.path.join(REPO_ROOT, raw)))
+
+    return files, sorted(edge_set), broken
+
+
+def reachable_from_entry(files, edges):
+    """Multi-root BFS over the edge set from EVERY always-loaded entry file
+    (root CLAUDE.md + backend/ + frontend/ CLAUDE.md). Returns reachable set."""
+    adj = defaultdict(list)
+    for s, t in edges:
+        adj[s].append(t)
+    seen = set()
+    q = deque()
+    for entry in ENTRY_FILES:
+        if os.path.exists(entry) and entry not in seen:
+            seen.add(entry)
+            q.append(entry)
+    while q:
+        n = q.popleft()
+        for m in adj[n]:
+            if m not in seen:
+                seen.add(m)
+                q.append(m)
+    return seen
+
+
+def analyze():
+    files, edges, broken = collect()
+    incoming = defaultdict(int)
+    for _, t in edges:
+        incoming[t] += 1
+    reachable = reachable_from_entry(files, edges)
+
+    entry_set = set(ENTRY_FILES)
+    orphans = []          # no incoming link AND not an entry file
+    for f in files:
+        if f in entry_set:
+            continue
+        if incoming[f] == 0 and os.path.basename(f) not in ALLOWED_ORPHANS:
+            orphans.append(f)
+
+    unreachable = [f for f in files if f not in reachable and f not in entry_set
+                   and os.path.basename(f) not in ALLOWED_ORPHANS]
+    return files, edges, broken, orphans, unreachable, reachable, incoming
+
+
+# --- mermaid output ---------------------------------------------------------
+def node_id(path, files):
+    return "n%d" % files.index(path)
+
+
+def short_label(path):
+    r = rel(path)
+    # collapse docs/ai/ prefix for readability
+    return r.replace("docs/ai/", "").replace("CLAUDE.md", "CLAUDE.md (root)")
+
+
+def write_mermaid(files, edges, orphans, unreachable, reachable):
+    orphan_set = set(orphans) | set(unreachable)
+    lines = [
+        "# docs/ai knowledge graph",
+        "",
+        "> Auto-generated by `docs/ai/_tools/doc_graph.py` — do not edit by hand.",
+        "> Green = reachable from CLAUDE.md. Red = orphan / unreachable (a navigating agent can't find it).",
+        "",
+        "```mermaid",
+        "graph LR",
+    ]
+    for f in files:
+        nid = node_id(f, files)
+        label = short_label(f).replace('"', "'")
+        lines.append(f'    {nid}["{label}"]')
+    lines.append("")
+    for s, t in edges:
+        lines.append(f"    {node_id(s, files)} --> {node_id(t, files)}")
+    lines.append("")
+    # styling
+    lines.append("    classDef root fill:#2a9d8f,stroke:#1b6d63,color:#fff;")
+    lines.append("    classDef ok fill:#e8f4e8,stroke:#49a,color:#123;")
+    lines.append("    classDef orphan fill:#fde2e2,stroke:#c0392b,color:#7a1f17,stroke-width:2px;")
+    entry_set = set(ENTRY_FILES)
+    for f in files:
+        nid = node_id(f, files)
+        if f in entry_set:
+            cls = "root"
+        elif f in orphan_set:
+            cls = "orphan"
+        else:
+            cls = "ok"
+        lines.append(f"    class {nid} {cls};")
+    lines.append("```")
+    lines.append("")
+    lines.append("## Orphans & unreachable")
+    if orphan_set:
+        for f in sorted(orphan_set):
+            lines.append(f"- ⚠️ `{rel(f)}`")
+    else:
+        lines.append("- ✅ none — every doc is reachable from the root.")
+    out = os.path.join(OUT_DIR, "doc_graph.md")
+    open(out, "w", encoding="utf-8").write("\n".join(lines) + "\n")
+    return out
+
+
+# --- html output ------------------------------------------------------------
+def write_html(files, edges, orphans, unreachable, reachable, incoming):
+    orphan_set = set(orphans) | set(unreachable)
+
+    def folder_of(path):
+        r = rel(path)
+        if r == "CLAUDE.md":
+            return "root"
+        parts = r.split("/")
+        # docs/ai/<folder>/...
+        return parts[2] if len(parts) > 3 else "(top)"
+
+    nodes = []
+    for f in files:
+        nodes.append({
+            "id": rel(f),
+            "label": short_label(f),
+            "folder": folder_of(f),
+            "orphan": f in orphan_set,
+            "root": f in set(ENTRY_FILES),
+            "incoming": incoming.get(f, 0),
+        })
+    links = [{"source": rel(s), "target": rel(t)} for s, t in edges]
+    data = {"nodes": nodes, "links": links}
+
+    html = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>docs/ai knowledge graph</title>
+<script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
+<style>
+  html,body{margin:0;height:100%;background:#0f172a;color:#e2e8f0;
+    font:13px/1.4 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
+  #hud{position:fixed;top:0;left:0;right:0;padding:10px 14px;z-index:10;
+    background:linear-gradient(#0f172af0,#0f172a00);display:flex;gap:18px;align-items:center;flex-wrap:wrap}
+  #hud h1{font-size:14px;margin:0;font-weight:700}
+  .stat{font-size:12px;color:#94a3b8}
+  .stat b{color:#e2e8f0}
+  .pill{display:inline-flex;align-items:center;gap:5px;font-size:11px;color:#cbd5e1}
+  .dot{width:9px;height:9px;border-radius:9px;display:inline-block}
+  svg{width:100vw;height:100vh;display:block;cursor:grab}
+  .link{stroke:#334155;stroke-width:1.2px}
+  .node circle{stroke:#0f172a;stroke-width:1.5px;cursor:pointer}
+  .node text{fill:#cbd5e1;font-size:10px;pointer-events:none}
+  .node:hover text{fill:#fff;font-weight:600}
+  .hint{position:fixed;bottom:10px;left:14px;color:#64748b;font-size:11px}
+</style></head>
+<body>
+<div id="hud">
+  <h1>docs/ai knowledge graph</h1>
+  <span class="stat"><b id="nf">0</b> files</span>
+  <span class="stat"><b id="ne">0</b> links</span>
+  <span class="stat" style="color:#f87171"><b id="no">0</b> orphans</span>
+  <span class="pill"><span class="dot" style="background:#2dd4bf"></span>root</span>
+  <span class="pill"><span class="dot" style="background:#7dd3fc"></span>reachable</span>
+  <span class="pill"><span class="dot" style="background:#f87171"></span>orphan / unreachable</span>
+</div>
+<svg></svg>
+<div class="hint">drag to move · scroll to zoom · click a node to copy its path · node size = incoming links</div>
+<script>
+const DATA = __DATA__;
+document.getElementById('nf').textContent = DATA.nodes.length;
+document.getElementById('ne').textContent = DATA.links.length;
+document.getElementById('no').textContent = DATA.nodes.filter(n=>n.orphan).length;
+
+const svg = d3.select("svg");
+const W = window.innerWidth, H = window.innerHeight;
+const g = svg.append("g");
+svg.call(d3.zoom().scaleExtent([0.2,4]).on("zoom", e => g.attr("transform", e.transform)));
+
+const color = d3.scaleOrdinal(d3.schemeTableau10);
+function fill(n){ if(n.root) return "#2dd4bf"; if(n.orphan) return "#f87171"; return "#7dd3fc"; }
+function radius(n){ return n.root ? 11 : Math.min(4 + n.incoming*2.2, 16); }
+
+const sim = d3.forceSimulation(DATA.nodes)
+  .force("link", d3.forceLink(DATA.links).id(d=>d.id).distance(70).strength(0.6))
+  .force("charge", d3.forceManyBody().strength(-260))
+  .force("center", d3.forceCenter(W/2, H/2))
+  .force("collide", d3.forceCollide().radius(d=>radius(d)+14));
+
+const link = g.append("g").selectAll("line").data(DATA.links)
+  .join("line").attr("class","link").attr("marker-end","url(#arrow)");
+
+svg.append("defs").append("marker").attr("id","arrow").attr("viewBox","0 -5 10 10")
+  .attr("refX",18).attr("refY",0).attr("markerWidth",6).attr("markerHeight",6)
+  .attr("orient","auto").append("path").attr("d","M0,-5L10,0L0,5").attr("fill","#475569");
+
+const node = g.append("g").selectAll("g").data(DATA.nodes)
+  .join("g").attr("class","node")
+  .call(d3.drag()
+    .on("start",(e,d)=>{if(!e.active)sim.alphaTarget(.3).restart();d.fx=d.x;d.fy=d.y;})
+    .on("drag",(e,d)=>{d.fx=e.x;d.fy=e.y;})
+    .on("end",(e,d)=>{if(!e.active)sim.alphaTarget(0);d.fx=null;d.fy=null;}));
+
+node.append("circle").attr("r",radius).attr("fill",fill);
+node.append("title").text(d=>d.id + "  (" + d.incoming + " incoming)");
+node.append("text").attr("x",d=>radius(d)+4).attr("y",3).text(d=>d.label);
+node.on("click",(e,d)=>{ navigator.clipboard?.writeText(d.id); });
+
+sim.on("tick",()=>{
+  link.attr("x1",d=>d.source.x).attr("y1",d=>d.source.y)
+      .attr("x2",d=>d.target.x).attr("y2",d=>d.target.y);
+  node.attr("transform",d=>`translate(${d.x},${d.y})`);
+});
+</script></body></html>"""
+    html = html.replace("__DATA__", json.dumps(data))
+    out = os.path.join(OUT_DIR, "doc_graph.html")
+    open(out, "w", encoding="utf-8").write(html)
+    return out
+
+
+def _autodetect_docs(repo_root):
+    """Pick a sensible docs root when --docs isn't given. Prefers docs/ai,
+    then docs/, else the repo root itself (small projects with docs at top)."""
+    for cand in (os.path.join(repo_root, "docs", "ai"),
+                 os.path.join(repo_root, "docs")):
+        if os.path.isdir(cand) and glob.glob(os.path.join(cand, "**", "*.md"), recursive=True):
+            return cand
+    return repo_root
+
+
+def configure(args):
+    """Set module-level roots from CLI args so the tool is repo-agnostic.
+    Defaults assume <repo>/tools/doc_graph.py and auto-detect the docs root;
+    --root/--docs/--entry override for any other layout."""
+    global REPO_ROOT, DOCS_ROOT, ENTRY_FILES
+    REPO_ROOT = os.path.abspath(args.root) if args.root else DEFAULT_REPO_ROOT
+    DOCS_ROOT = (os.path.abspath(args.docs) if args.docs
+                 else _autodetect_docs(REPO_ROOT))
+    if args.entry:
+        ENTRY_FILES = [os.path.abspath(e) for e in args.entry]
+    else:
+        # Default entry points = every always-loaded CLAUDE.md that exists.
+        ENTRY_FILES = [p for p in (
+            os.path.join(REPO_ROOT, "CLAUDE.md"),
+            os.path.join(REPO_ROOT, "backend", "CLAUDE.md"),
+            os.path.join(REPO_ROOT, "frontend", "CLAUDE.md"),
+        ) if os.path.exists(p)]
+        # Fallback: if no CLAUDE.md, seed reachability from the docs index
+        # (README.md at the docs root) so the tool still works tool-agnostically.
+        if not ENTRY_FILES:
+            idx = os.path.join(DOCS_ROOT, "README.md")
+            if os.path.exists(idx):
+                ENTRY_FILES = [idx]
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Render the docs knowledge tree as a graph + flag orphans/broken links.")
+    ap.add_argument("--root", help="repo root (default: 3 levels up from this script)")
+    ap.add_argument("--docs", help="docs root to scan (default: <root>/docs/ai)")
+    ap.add_argument("--entry", nargs="*",
+                    help="entry .md file(s) reachability is measured from "
+                         "(default: root + backend + frontend CLAUDE.md)")
+    ap.add_argument("--no-html", action="store_true",
+                    help="skip the interactive HTML (e.g. in CI)")
+    ap.add_argument("--check", action="store_true",
+                    help="CI mode: exit 1 if any orphan/unreachable/broken exists. "
+                         "NOTE: gates on ABSOLUTE count, not a delta baseline — "
+                         "only wire to CI AFTER the tree is clean.")
+    args = ap.parse_args()
+    configure(args)
+
+    # Guard: an empty docs root almost always means a misconfigured --docs/--root.
+    # Reporting "0 orphans" on an empty tree is a silent false-negative — the
+    # worst failure for a checker (Searcher-3 finding #5). Fail loudly instead.
+    probe = glob.glob(os.path.join(DOCS_ROOT, "**", "*.md"), recursive=True)
+    if not probe:
+        print(f"ERROR: no .md files found under docs root: {DOCS_ROOT}", file=sys.stderr)
+        print("       pass --docs / --root to point at the right tree.", file=sys.stderr)
+        sys.exit(2)
+    if not ENTRY_FILES:
+        print("ERROR: no entry file found (looked for CLAUDE.md). "
+              "Pass --entry <file.md>.", file=sys.stderr)
+        sys.exit(2)
+
+    files, edges, broken, orphans, unreachable, reachable, incoming = analyze()
+    md = write_mermaid(files, edges, orphans, unreachable, reachable)
+    print(f"files={len(files)}  edges={len(edges)}  "
+          f"reachable={len(reachable)}  orphans={len(orphans)}  "
+          f"unreachable={len(unreachable)}  broken={len(broken)}")
+    print(f"wrote: {rel(md)}")
+    if not args.no_html:
+        html = write_html(files, edges, orphans, unreachable, reachable, incoming)
+        print(f"wrote: {rel(html)}")
+
+    problems = set(orphans) | set(unreachable)
+    if problems:
+        print("\nORPHANS / UNREACHABLE (a navigating agent can't reach these):")
+        for f in sorted(problems):
+            print(f"  - {rel(f)}")
+    if broken:
+        print("\nBROKEN LINKS:")
+        for s, raw, t in broken:
+            print(f"  - {rel(s)}  ->  {raw}")
+
+    if args.check and (problems or broken):
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
