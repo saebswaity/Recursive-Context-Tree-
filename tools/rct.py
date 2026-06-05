@@ -37,6 +37,23 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import doc_graph  # noqa: E402  (parsing primitives - never reimplemented here)
 
 
+# Directories never worth walking/scanning for suggestions or undocumented.
+SKIP_DIRS = {
+    ".git", "node_modules", "__pycache__", "dist", "build", ".venv", "venv",
+    ".next", "coverage", ".mypy_cache", ".pytest_cache", ".tox", "vendor",
+    "__mocks__", ".idea", ".vscode",
+}
+# Built-in `undocumented` ignores so the FIRST run on a real repo isn't drowned
+# in boilerplate. RCT documents modules, not migrations/tests/generated files.
+# A repo-root .rctignore EXTENDS (never replaces) these.
+DEFAULT_IGNORE_DIRS = SKIP_DIRS | {"migrations", "tests", "test", "__tests__"}
+DEFAULT_IGNORE_GLOBS = [
+    "__init__.py", "conftest.py", "setup.py", "manage.py", "wsgi.py", "asgi.py",
+    "test_*.py", "*_test.py", "*.test.ts", "*.test.tsx", "*.test.js",
+    "*.spec.ts", "*.spec.tsx", "*.spec.js", "*.min.js", "*.d.ts",
+]
+
+
 # --- shared helpers ---------------------------------------------------------
 def _resolve(arg):
     """Resolve a user-supplied path (CWD-relative or repo-root-relative) to an
@@ -93,6 +110,46 @@ def _cite_lines(doc_abs, raw_path):
     return [i + 1 for i, ln in enumerate(lines) if raw_path in ln or base in ln]
 
 
+def _all_repo_files():
+    """Repo-root-relative posix paths of every file on disk (heavy dirs skipped).
+    Used to answer 'does a file by this name exist anywhere?' for verify's
+    suggestions - a filesystem walk, so it works pre-commit and without git."""
+    out = []
+    for root, dirs, files in os.walk(doc_graph.REPO_ROOT):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+        for fn in files:
+            out.append(_relposix(os.path.join(root, fn)))
+    return out
+
+
+def _suggest(raw, all_files):
+    """Classify a non-resolving citation against the files that DO exist.
+
+    Returns (kind, suggestion, candidates):
+      'style'     -> the path is written wrong but a file clearly exists; the
+                     suggestion is the repo-root-relative path to use. Most
+                     likely a module-relative citation that should be repo-root.
+      'ambiguous' -> several files match; can't pick one - a human must.
+      'missing'   -> no file by this name exists anywhere -> a genuine gap
+                     (deleted / renamed / typo). THIS is the true finding.
+
+    Match precedence: exact path-suffix first (precise), then basename."""
+    raw_n = raw.lstrip("./").lower()
+    base = os.path.basename(raw_n)
+    suffix = [f for f in all_files
+              if f.lower() == raw_n or f.lower().endswith("/" + raw_n)]
+    if len(suffix) == 1:
+        return "style", suffix[0], suffix
+    if len(suffix) > 1:
+        return "ambiguous", None, suffix
+    bm = [f for f in all_files if os.path.basename(f).lower() == base]
+    if len(bm) == 1:
+        return "style", bm[0], bm
+    if len(bm) > 1:
+        return "ambiguous", None, bm
+    return "missing", None, []
+
+
 def _setup(args):
     """Point doc_graph's module globals at the requested repo/docs/entry."""
     doc_graph.configure(args)
@@ -124,7 +181,14 @@ def cmd_refs(args):
 
 def cmd_verify(args):
     """Hard check: every cited code path must exist on disk (from code_broken).
-    Exit non-zero if any stale citation is found in scope."""
+    Exit non-zero if any stale citation is found in scope.
+
+    The resolver stays STRICT (a path that doesn't resolve as written is broken)
+    but the OUTPUT is diagnostic: each failure is classified against the files
+    that actually exist, so a wrong-style citation ('did you mean ...?') is
+    visibly distinct from a genuinely missing/renamed file. This is the
+    difference between 'N cryptic failures' and 'N-k one-click fixes + k real
+    gaps' on a repo that hasn't yet normalized its citations."""
     _, _, _, _, code_broken = doc_graph.collect()
     scope = code_broken
     if args.doc and not args.all:
@@ -136,11 +200,40 @@ def cmd_verify(args):
     if not scope:
         print(f"OK: every code path cited by {label} exists on disk.")
         return 0
-    print(f"STALE CITATIONS in {label} "
-          f"(a doc cites a code path that does not exist):")
+
+    all_files = _all_repo_files()
+    buckets = {"style": [], "ambiguous": [], "missing": []}
     for doc, raw in scope:
-        print(f"  - {_relposix(doc)}  ->  {raw}")
-    print(f"\n{len(scope)} stale citation(s). Fix the path or update the doc.")
+        kind, sugg, cands = _suggest(raw, all_files)
+        buckets[kind].append((doc, raw, sugg, cands))
+
+    print(f"STALE CITATIONS in {label} "
+          f"(a doc cites a code path that does not resolve as written):\n")
+    if buckets["style"]:
+        print("LIKELY PATH-STYLE MISMATCH - a file clearly exists; rewrite the "
+              "citation to the repo-root-relative path shown:")
+        for doc, raw, sugg, _ in buckets["style"]:
+            print(f"  - {_relposix(doc)}:  `{raw}`  ->  did you mean  `{sugg}`")
+        print()
+    if buckets["ambiguous"]:
+        print("AMBIGUOUS - several files match this name; a human must pick:")
+        for doc, raw, _, cands in buckets["ambiguous"]:
+            preview = ", ".join(cands[:3]) + (" ..." if len(cands) > 3 else "")
+            print(f"  - {_relposix(doc)}:  `{raw}`  ->  candidates: {preview}")
+        print()
+    if buckets["missing"]:
+        print("NO MATCHING FILE - nothing by this name exists anywhere. Likely a "
+              "deleted/renamed/typo'd file (a REAL doc<->code gap):")
+        for doc, raw, _, _ in buckets["missing"]:
+            print(f"  - {_relposix(doc)}:  `{raw}`")
+        print()
+
+    s, a, m = len(buckets["style"]), len(buckets["ambiguous"]), len(buckets["missing"])
+    print(f"{len(scope)} stale citation(s): {s} likely style mismatch (fix shown), "
+          f"{a} ambiguous, {m} with no matching file (likely real gaps).")
+    if s or a:
+        print("Tip: normalize Key-Files citations to single-backtick, "
+              "repo-root-relative paths (see docs/ai/TEMPLATE.md).")
     return 1
 
 
@@ -217,9 +310,11 @@ def _load_rctignore():
 
 
 def cmd_undocumented(args):
-    """Advisory (never a gate): tracked source files (git ls-files ∩ CODE_EXT,
-    minus .rctignore) that no doc cites. Coarse by design - RCT documents
-    modules, not every file."""
+    """Advisory (never a gate): tracked source files (git ls-files ∩ CODE_EXT)
+    that no doc cites, minus BUILT-IN ignores (migrations/tests/__init__/
+    generated/min/spec) and any repo-root .rctignore. Coarse by design - RCT
+    documents modules, not every file - so the first run isn't drowned in
+    boilerplate."""
     import fnmatch
     ls = _git("ls-files")
     if ls is None:
@@ -231,11 +326,17 @@ def cmd_undocumented(args):
 
     _, _, _, code_edges, _ = doc_graph.collect()
     cited = {os.path.normcase(_relposix(code)) for _, code in code_edges}
-    ignore = _load_rctignore()
+    user_ignore = _load_rctignore()
 
     def is_ignored(p):
-        return any(fnmatch.fnmatch(p, pat) or p.startswith(pat.rstrip("/") + "/")
-                   for pat in ignore)
+        segs = p.split("/")
+        if any(s in DEFAULT_IGNORE_DIRS for s in segs):
+            return True
+        base = os.path.basename(p)
+        if any(fnmatch.fnmatch(base, g) for g in DEFAULT_IGNORE_GLOBS):
+            return True
+        return any(fnmatch.fnmatch(p, pat) or fnmatch.fnmatch(base, pat)
+                   or p.startswith(pat.rstrip("/") + "/") for pat in user_ignore)
 
     if args.code_file and not args.all:
         rel = _relposix(_resolve(args.code_file))
@@ -243,23 +344,28 @@ def cmd_undocumented(args):
         if key in cited:
             print(f"{rel} IS cited by at least one doc.")
         elif is_ignored(rel):
-            print(f"{rel} is undocumented but matched by .rctignore (intentional).")
+            print(f"{rel} is undocumented but ignored (boilerplate/test/generated "
+                  "or .rctignore) - intentional.")
         else:
             print(f"{rel} is NOT cited by any doc (advisory).")
         return 0
 
-    undoc = [p for p in code_files
-             if os.path.normcase(p) not in cited and not is_ignored(p)]
+    not_cited = [p for p in code_files if os.path.normcase(p) not in cited]
+    ignored = [p for p in not_cited if is_ignored(p)]
+    undoc = [p for p in not_cited if not is_ignored(p)]
     if not undoc:
-        print(f"OK: every tracked source file ({len(code_files)} scanned) is cited "
+        print(f"OK: every tracked source file ({len(code_files)} scanned, "
+              f"{len(ignored)} ignored as boilerplate/test/generated) is cited "
               "by some doc (or ignored).")
         return 0
     print(f"UNDOCUMENTED (advisory) - {len(undoc)} of {len(code_files)} tracked "
-          "source files are cited by no doc:")
+          f"source files are cited by no doc "
+          f"({len(ignored)} boilerplate/test/generated files already excluded):")
     for p in sorted(undoc):
         print(f"  - {p}")
     print("\nThis is advisory, never a gate. RCT documents modules that matter - "
-          "many of these may not need a doc. Add a `.rctignore` to silence the noise.")
+          "many of these may not need a doc. Extend the built-in ignores with a "
+          "repo-root `.rctignore` (one fnmatch pattern per line).")
     return 0
 
 

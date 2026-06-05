@@ -78,7 +78,7 @@ nothing can silently go stale. It writes **no files**.
 | `rct verify [<doc>\|--all]` | Does every code path a doc cites still exist on disk? | **Hard** — exits 1 on a dead citation (zero false positives: a path resolves or it doesn't). Working-tree truth. |
 | `rct orphans` | md→md reachability — orphans / unreachable / broken md links. | Exits 1 on any md problem (same signal as `doc_graph.py --check`). |
 | `rct stale [<doc>\|--all]` | Was a doc's cited code **committed** more recently than the doc? | **Warn only** — heuristic; only you know if the change was doc-worthy. Reflects committed history, not the working tree. |
-| `rct undocumented [<f>\|--all]` | Which tracked source files does no doc cite? | **Advisory only** — RCT documents modules, not every file. Silence noise with a `.rctignore`. |
+| `rct undocumented [<f>\|--all]` | Which tracked source files does no doc cite? | **Advisory only** — RCT documents modules, not every file. Built-in ignores skip migrations/tests/generated; extend with a `.rctignore`. |
 | `rct guard [--staged\|--ci --base <ref>]` | Commit / CI gate. | Implemented in Phase 3. |
 
 ```bash
@@ -93,3 +93,31 @@ Shared flags `--root` / `--docs` / `--entry` mean exactly what they do for
 (a cited path that doesn't resolve), **warn on everything uncertain** (code
 moved but the doc didn't). A gate that's always right when it fires is one nobody
 disables.
+
+### `verify` is diagnostic, not just pass/fail
+
+The resolver stays strict (a path that doesn't resolve **as written** is broken),
+but the output classifies each failure against the files that actually exist, so
+adopting RCT on a repo whose docs aren't yet normalized gives you a fix-list, not
+a wall of cryptic errors:
+
+- **LIKELY PATH-STYLE MISMATCH** — a file of that name clearly exists; `verify`
+  prints `did you mean → backend/x/y.py`. Usually a module-relative or bare
+  citation that should be repo-root-relative. One-click rewrites.
+- **AMBIGUOUS** — several files match the name; a human picks.
+- **NO MATCHING FILE** — nothing by that name exists anywhere → a genuine
+  deleted/renamed/typo'd file. **These are the real doc↔code gaps.**
+
+So "75 failures" becomes "66 style rewrites + N ambiguous + the handful of real
+gaps" — and a moved file is no longer indistinguishable from a mis-styled path.
+
+### What RCT does *not* check (by design)
+
+It verifies **existence** (does the cited path resolve?) and **git-time**
+staleness — never **semantic** sync. A doc that says "11 ViewSets" when the code
+has 13 still passes `verify`: the file exists, so the citation is valid. Prose
+accuracy is a human-review concern; RCT keeps the mechanical claims honest so
+review can focus on the rest. Also note: **bare-filename citations** (`` `models.py` ``,
+no `/`) are intentionally invisible to the tooling — adopt the backtick
+repo-root-relative convention (see [`docs/ai/TEMPLATE.md`](../docs/ai/TEMPLATE.md))
+to make them checkable.

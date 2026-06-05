@@ -25,6 +25,12 @@ encoding the four cases from the plan:
 The md→md assertions are the regression guard: they must stay identical as the
 md→code bridge evolves.
 
+`test_rct.py` also covers `verify`'s **diagnostic** output via a second fixture,
+`fixtures/style/`, where a doc cites a real file (`src/widget.py`) with the wrong
+path (`lib/widget.py`): verify must still fail (exit 1) but classify it as a
+PATH-STYLE MISMATCH and suggest the repo-root-relative path — distinct from the
+`sample/` fixture's truly-missing file, which is classified as a real gap.
+
 > Note: the fixtures live under `tests/`, not `docs/ai/`, so a normal
 > `python3 tools/doc_graph.py` run (which auto-detects `docs/ai/`) never scans
 > them. The test points the tool at the fixture explicitly via `--root`/`--docs`.
