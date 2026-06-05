@@ -17,6 +17,14 @@ This script makes reachability a one-command fact.
 - Computes which docs are **reachable** from the entry file(s) via BFS.
 - Flags **orphans** (nothing links in), **unreachable** (island clusters), and
   **broken links** (target missing).
+- **The md→code bridge:** also harvests backtick citations of *source* files
+  (the Key-Files style, `` `path/to/file.py` ``) and reports them as
+  `code_edges` (the cited file exists) and **stale code citations**
+  (`code_broken` — a doc cites a code path that resolves nowhere: a deleted/
+  renamed/typo'd file). This is **purely additive** — md→md reachability,
+  orphans, and the `--check` exit code are byte-identical to before the bridge.
+  The stale-citation list is printed as **information**; the hard gate over it
+  lives in the `rct` CLI (`rct verify`), not in `--check` here.
 - Emits a **Mermaid** graph (`doc_graph.md` — renders on GitHub, commit it) and an
   **interactive D3 HTML** (`doc_graph.html` — git-ignore it, regenerate locally).
 
@@ -39,6 +47,7 @@ Examples shown fenced so the checker doesn't count them as real edges:
 [label](./file.md)        standard markdown link
 [label](./dir/)           folder-link -> resolves to dir/README.md
 `docs/ai/foo.md`          inline-backtick path citation (Key-Files style)
+`backend/foo.py`          inline-backtick CODE path -> md→code bridge (not an .md edge)
 @docs/ai/README.md        @import (honored in CLAUDE.md files only)
 ```
 
@@ -54,3 +63,33 @@ A delta-gate (fail only on *new* problems vs a committed baseline) is the durabl
 ### Outputs
 - `doc_graph.md` — commit it (renders on GitHub).
 - `doc_graph.html` — git-ignore it (large, stale-on-change, needs a CDN for d3).
+
+## rct.py — agent-facing verbs over the tree
+
+`rct.py` is a thin CLI on top of `doc_graph.py`: it **imports** that module's
+parsing primitives (never reimplements them) and turns the md→code bridge into
+the commands an agent needs around editing, creating, and deleting code. Every
+command recomputes from real files + git at call time — nothing is stored, so
+nothing can silently go stale. It writes **no files**.
+
+| Command | What it answers | Gate? |
+|---------|-----------------|-------|
+| `rct refs <code_file>` | Which docs cite this file? **Run before editing** — these are the docs you may need to reconcile after. | — |
+| `rct verify [<doc>\|--all]` | Does every code path a doc cites still exist on disk? | **Hard** — exits 1 on a dead citation (zero false positives: a path resolves or it doesn't). Working-tree truth. |
+| `rct orphans` | md→md reachability — orphans / unreachable / broken md links. | Exits 1 on any md problem (same signal as `doc_graph.py --check`). |
+| `rct stale [<doc>\|--all]` | Was a doc's cited code **committed** more recently than the doc? | **Warn only** — heuristic; only you know if the change was doc-worthy. Reflects committed history, not the working tree. |
+| `rct undocumented [<f>\|--all]` | Which tracked source files does no doc cite? | **Advisory only** — RCT documents modules, not every file. Silence noise with a `.rctignore`. |
+| `rct guard [--staged\|--ci --base <ref>]` | Commit / CI gate. | Implemented in Phase 3. |
+
+```bash
+python3 tools/rct.py refs backend/payments/services.py   # before you edit it
+python3 tools/rct.py verify --all                        # CI/working-tree hard check
+python3 tools/rct.py orphans                             # reachability
+python3 tools/rct.py stale --all                         # git-derived staleness (warn)
+```
+
+Shared flags `--root` / `--docs` / `--entry` mean exactly what they do for
+`doc_graph.py`. The split is deliberate: **hard-block only on what's certain**
+(a cited path that doesn't resolve), **warn on everything uncertain** (code
+moved but the doc didn't). A gate that's always right when it fires is one nobody
+disables.

@@ -35,6 +35,14 @@ Recognized link dialects (a missing dialect = false orphans):
   `path/to/file.md`      inline-backtick path (the Key-Files citation style)
   @path/to/file.md       @import (honored in CLAUDE.md files only)
 Links inside fenced code blocks and <!-- comments --> are ignored (examples).
+
+The md->code bridge (additive, never gates this script's --check):
+  `path/to/file.py`      inline-backtick CODE path -> a doc->code citation
+collect() also returns these as `code_edges` (the cited file exists on disk) and
+`code_broken` (a doc cites a code path that resolves nowhere — a stale citation).
+This is the raw material the `rct` CLI turns into agent-facing verbs (refs/verify/
+stale). It NEVER affects md->md reachability, orphans, or the --check exit code —
+those stay byte-identical to before the bridge existed.
 """
 import os
 import re
@@ -89,6 +97,49 @@ COMMENT_RE = re.compile(r'<!--.*?-->', re.DOTALL)
 # `[x](./dir/)` so prose EXAMPLES of link syntax aren't counted as real edges.
 INLINE_CODE_RE = re.compile(r'`[^`\n]*`')
 
+# --- md->code bridge ---------------------------------------------------------
+# Source-file extensions RCT users actually cite in Key-Files tables. NOT
+# exhaustive on purpose: the goal is "looks like a code path", and the `/`
+# heuristic below catches anything with a directory component regardless of
+# extension. Extend freely — a missing extension just means a bare-filename
+# citation (no slash) won't be harvested, never a wrong edge.
+CODE_EXT = {
+    ".py", ".pyi", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".vue",
+    ".svelte", ".go", ".rs", ".java", ".kt", ".kts", ".scala", ".rb", ".php",
+    ".c", ".h", ".cc", ".cpp", ".hpp", ".cs", ".swift", ".m", ".mm", ".sql",
+    ".sh", ".bash", ".ps1", ".lua", ".dart", ".ex", ".exs", ".clj", ".r",
+    ".html", ".css", ".scss", ".json", ".yaml", ".yml", ".toml", ".proto",
+}
+# Any inline single-backtick span — the candidate text for a code-path citation.
+# The same span style as BACKTICK_PATH_RE, but here we KEEP non-.md hits and
+# decide path-ness with _is_code_citation() rather than a hard-coded suffix.
+BACKTICK_SPAN_RE = re.compile(r'`([^`\n]+?)`')
+# A trailing :line / :line:col location suffix on a citation (e.g. `foo.py:42`).
+LOC_SUFFIX_RE = re.compile(r':\d+(?::\d+)?$')
+
+
+def _is_code_citation(raw: str) -> bool:
+    """Conservative: is this backtick span a concrete repo path to a CODE file?
+
+    Requires a PATH COMPONENT ("/") — which the locked Key-Files convention
+    guarantees (citations are backtick, repo-root-relative). That single rule
+    drops the false positives a looser heuristic invites: bare-filename prose
+    ("rename `services.py` to `domain.py`"), globs (`.cursor/rules/*.mdc`), and
+    call syntax (`useState()`). It is the conservatism that lets the derived
+    `code_broken` signal hard-gate without firing on prose (invariant 5).
+
+    Whether a NON-resolving candidate is reported broken is decided at the call
+    site by its extension (must be in CODE_EXT); existence on disk proves an
+    edge regardless of extension.
+    """
+    if not raw or raw.endswith(".md"):
+        return False  # .md is the md->md harvester's job
+    if raw.startswith(("http://", "https://", "//")):
+        return False
+    if any(c in raw for c in "*?()[]<> "):
+        return False  # glob / call / prose noise — not a concrete path
+    return "/" in raw
+
 
 def strip_fences(text: str) -> str:
     """Remove fenced code blocks + HTML comments. Inline backtick spans are
@@ -104,16 +155,23 @@ def rel(path: str) -> str:
 
 
 def collect():
-    """Return (files, edges, broken).
+    """Return (files, edges, broken, code_edges, code_broken).
 
     files: list of abs paths to every .md under DOCS_ROOT (+ the entry files)
     edges: list of UNIQUE (src_abs, dst_abs) for every resolvable .md reference
     broken: list of (src_abs, raw_link, resolved_missing_abs)
+    code_edges: UNIQUE (doc_abs, code_abs) — a doc cites a CODE file that exists
+    code_broken: list of (doc_abs, raw_path) — a doc cites a code path that
+                 resolves NOWHERE (a deleted/renamed/typo'd source file)
 
     A "reference" is a standard [](.md) link, a folder-link ([](./dir/) →
     dir/README.md), an inline-backtick `path.md` citation, or — in CLAUDE.md
     files only — an @import. Fenced code blocks + HTML comments are stripped
     first so example links inside them aren't counted.
+
+    The md->code bridge (code_edges / code_broken) is purely additive: it does
+    NOT influence files/edges/broken, reachability, or orphans. The first three
+    return values are byte-identical to before the bridge existed.
     """
     files = sorted(glob.glob(os.path.join(DOCS_ROOT, "**", "*.md"), recursive=True))
     for entry in ENTRY_FILES:
@@ -121,6 +179,7 @@ def collect():
             files = [entry] + files
 
     edge_set, broken = set(), []
+    code_edge_set, code_broken = set(), []
     fileset = set(files)
 
     def add(f, raw, resolved):
@@ -159,6 +218,27 @@ def collect():
             # Bare path that doesn't resolve → NOT reported broken: backtick
             # spans are also used for illustrative paths, so only count hits.
 
+        # 1b. inline-backtick `path.ext` citations of SOURCE CODE (non-.md) —
+        #     the md->code bridge. Harvested here (alongside the .md backtick
+        #     pass, before INLINE_CODE_RE strips the spans) using the SAME
+        #     two-step resolution: doc dir first, then repo-root-relative.
+        for raw in BACKTICK_SPAN_RE.findall(text):
+            cite = LOC_SUFFIX_RE.sub("", raw.split("#", 1)[0]).strip()
+            if not _is_code_citation(cite):
+                continue
+            cand_base = os.path.normpath(os.path.join(base, cite))
+            cand_repo = os.path.normpath(os.path.join(REPO_ROOT, cite))
+            if os.path.isfile(cand_base):
+                code_edge_set.add((f, cand_base))
+            elif os.path.isfile(cand_repo):
+                code_edge_set.add((f, cand_repo))
+            elif os.path.splitext(cite)[1].lower() in CODE_EXT:
+                # A recognized code path that resolves NOWHERE → a stale
+                # citation: the unfakeable signal of a doc pointing at a
+                # deleted/renamed/typo'd source file. Extensionless slash-paths
+                # that don't resolve are left unreported (could be a dir ref).
+                code_broken.append((f, cite))
+
         # Now strip ALL inline-code spans, so link syntax shown as code in
         # prose — e.g. `[Items](./items/)` documenting the syntax — is not
         # mistaken for a real link/folder edge (the example-link false positive).
@@ -181,7 +261,7 @@ def collect():
             for raw in IMPORT_RE.findall(text):
                 add(f, raw, os.path.normpath(os.path.join(REPO_ROOT, raw)))
 
-    return files, sorted(edge_set), broken
+    return files, sorted(edge_set), broken, sorted(code_edge_set), code_broken
 
 
 def reachable_from_entry(files, edges):
@@ -206,7 +286,7 @@ def reachable_from_entry(files, edges):
 
 
 def analyze():
-    files, edges, broken = collect()
+    files, edges, broken, code_edges, code_broken = collect()
     incoming = defaultdict(int)
     for _, t in edges:
         incoming[t] += 1
@@ -222,7 +302,8 @@ def analyze():
 
     unreachable = [f for f in files if f not in reachable and f not in entry_set
                    and os.path.basename(f) not in ALLOWED_ORPHANS]
-    return files, edges, broken, orphans, unreachable, reachable, incoming
+    return (files, edges, broken, orphans, unreachable, reachable, incoming,
+            code_edges, code_broken)
 
 
 # --- mermaid output ---------------------------------------------------------
@@ -241,7 +322,7 @@ def write_mermaid(files, edges, orphans, unreachable, reachable):
     lines = [
         "# docs/ai knowledge graph",
         "",
-        "> Auto-generated by `docs/ai/_tools/doc_graph.py` — do not edit by hand.",
+        "> Auto-generated by `tools/doc_graph.py` — do not edit by hand.",
         "> Green = reachable from CLAUDE.md. Red = orphan / unreachable (a navigating agent can't find it).",
         "",
         "```mermaid",
@@ -458,11 +539,14 @@ def main():
               "Pass --entry <file.md>.", file=sys.stderr)
         sys.exit(2)
 
-    files, edges, broken, orphans, unreachable, reachable, incoming = analyze()
+    (files, edges, broken, orphans, unreachable, reachable, incoming,
+     code_edges, code_broken) = analyze()
     md = write_mermaid(files, edges, orphans, unreachable, reachable)
     print(f"files={len(files)}  edges={len(edges)}  "
           f"reachable={len(reachable)}  orphans={len(orphans)}  "
           f"unreachable={len(unreachable)}  broken={len(broken)}")
+    print(f"code_edges={len(code_edges)}  code_broken={len(code_broken)}  "
+          f"(md->code bridge - informational; the hard gate is `rct verify`)")
     print(f"wrote: {rel(md)}")
     if not args.no_html:
         html = write_html(files, edges, orphans, unreachable, reachable, incoming)
@@ -476,6 +560,13 @@ def main():
     if broken:
         print("\nBROKEN LINKS:")
         for s, raw, t in broken:
+            print(f"  - {rel(s)}  ->  {raw}")
+    if code_broken:
+        # Informational here (a doc cites a code path that resolves nowhere).
+        # NOT part of --check: the md->md gate stays byte-identical, and the
+        # unfakeable code-citation gate lives in `rct verify` (Phase 2).
+        print("\nSTALE CODE CITATIONS (doc cites a code path that doesn't exist):")
+        for s, raw in code_broken:
             print(f"  - {rel(s)}  ->  {raw}")
 
     if args.check and (problems or broken):

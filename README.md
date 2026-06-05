@@ -309,6 +309,21 @@ Every module README follows the same format:
 - [other-module](../other-module/) — how they connect
 ```
 
+> **Two regions, one hard rule (this is what makes the docs machine-checkable).**
+> A module README has a **checkable** region and an **intent** region, and the
+> tooling treats them differently:
+> - **Key Files = checkable.** Every code-file reference is a **single-backtick,
+>   repo-root-relative path**, one per row — e.g. `` `backend/payments/services.py` ``.
+>   The leading directory component is what lets `tools/doc_graph.py` resolve and
+>   verify it. A bare filename in prose is *not* a citation and is ignored. The
+>   tools **verify** these paths and **suggest** candidates, but a human **picks**
+>   which files matter — never auto-fill the table from an AST.
+> - **Critical Patterns + Decisions = intent.** Human-owned "why". The tools check
+>   only that the doc is *reachable*; they never read or auto-author its content.
+>
+> A fill-in stencil with this layout ships at
+> [`docs/ai/TEMPLATE.md`](./docs/ai/TEMPLATE.md).
+
 ### The Golden Rules
 
 1. **Write "what IS" not "what was done"**
@@ -440,7 +455,7 @@ This is not optional. Treat doc updates as part of task completion.
 
 The maintenance rule helps, but docs still drift. Use these strategies to catch it early:
 
-**1. The `Last verified` date is your first defense.** Every module README has one. If it's older than 2-3 weeks on an actively developed module, treat the doc as suspect. Add a periodic check to your workflow — weekly for active modules, monthly for stable ones.
+**1. The `Last verified` date is an optional, honest annotation — not a gate.** Keep it if you find a hand-written "I last checked this on…" useful, but treat it as advisory only. It is deliberately **never** gate-enforced: a check that passes because someone bumped a timestamp just trains the meaningless bump (the timestamp-gaming trap). The **authoritative** staleness signal is git-derived — comparing the commit time of a doc against the commit time of the code its Key Files table cites — because that reads reality, not an edit. The forthcoming `rct stale` computes exactly this; the manual date is a courtesy, not the source of truth.
 
 **2. Git-based staleness detection.** If files listed in a module's Key Files table have been modified more recently than the README itself, the README is likely stale. You can automate this:
 
@@ -524,7 +539,51 @@ The pattern's "what IS" framing has no home for "what we considered and rejected
 - **An always-loaded memory file** (e.g. the `memory/MEMORY.md` some tools load every session) for decisions that must survive regardless of navigation — no link-following required.
 - **An explicit "Under consideration / Decided against" section** in the relevant module or index README, with a link to the full proposal doc — so the decision is reachable.
 
-The established name for these is an **ADR (Architecture Decision Record)**. If you accumulate many, give them their own indexed folder (`docs/ai/decisions/`) linked from the root index — so they're reachable by construction.
+The established name for these is an **ADR (Architecture Decision Record)**. If you accumulate many, give them their own indexed folder (`docs/ai/decisions/`) linked from the root index — so they're reachable by construction. This repo dogfoods that: see [`docs/ai/decisions/`](./docs/ai/decisions/) for a live, indexed example.
+
+---
+
+## Installing the Mechanical Tooling (for an AI agent)
+
+The pattern above is conventions an agent follows. This repo also ships two
+zero-dependency Python files (`tools/doc_graph.py`, `tools/rct.py`) that turn
+those conventions into checks. To install them into **any** repo:
+
+**Agent install steps:**
+
+1. **Copy both files** into the target repo's `tools/` directory (create it if
+   absent). They must sit together — `rct.py` imports `doc_graph.py`:
+   ```bash
+   mkdir -p <target-repo>/tools
+   cp tools/doc_graph.py tools/rct.py <target-repo>/tools/
+   ```
+   Keep them at the **repo-root** `tools/` — the scripts compute the repo root as
+   the folder above themselves, so `tools/` at the root is what makes
+   repo-root-relative citations resolve. (Running from elsewhere? Pass
+   `--root/--docs/--entry` instead.)
+2. **Smoke-test** from the target repo root (Python 3, no install needed):
+   ```bash
+   python3 tools/doc_graph.py --no-html
+   ```
+   It auto-detects `docs/ai/` and seeds reachability from the root + any
+   `backend/`/`frontend/` `CLAUDE.md`. A non-empty `files=` count means it found
+   your tree. (Empty? It tells you to pass `--docs`.)
+3. **Make sure your Key Files tables follow the one convention** the checks
+   depend on: each cited code file is a **single-backtick, repo-root-relative
+   path** (e.g. `` `backend/payments/services.py` ``). Citations in other styles
+   are invisible to the tooling — see [`docs/ai/TEMPLATE.md`](./docs/ai/TEMPLATE.md).
+
+**The commands an agent then uses** (full table in [`tools/README.md`](./tools/README.md)):
+
+```bash
+python3 tools/rct.py refs <code_file>   # BEFORE editing: which docs cite this file?
+python3 tools/rct.py verify --all       # hard check: every cited code path exists on disk
+python3 tools/rct.py orphans            # md reachability: any unreachable/broken docs?
+python3 tools/rct.py stale --all        # warning: cited code committed newer than its doc
+```
+
+Wiring these into a pre-commit hook and CI (delta-gated, red only on *new*
+breaks) is the next step — see `tools/README.md`.
 
 ---
 
