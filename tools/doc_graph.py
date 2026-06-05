@@ -136,8 +136,8 @@ def _is_code_citation(raw: str) -> bool:
         return False  # .md is the md->md harvester's job
     if raw.startswith(("http://", "https://", "//")):
         return False
-    if any(c in raw for c in "*?()[]<> "):
-        return False  # glob / call / prose noise — not a concrete path
+    if any(c in raw for c in "*?()[]<> {}"):
+        return False  # glob / call / prose / {placeholder} noise — not a concrete path
     return "/" in raw
 
 
@@ -364,7 +364,8 @@ def write_mermaid(files, edges, orphans, unreachable, reachable):
 
 
 # --- html output ------------------------------------------------------------
-def write_html(files, edges, orphans, unreachable, reachable, incoming):
+def write_html(files, edges, orphans, unreachable, reachable, incoming,
+               code_edges=(), code_broken=()):
     orphan_set = set(orphans) | set(unreachable)
 
     def folder_of(path):
@@ -380,13 +381,41 @@ def write_html(files, edges, orphans, unreachable, reachable, incoming):
         nodes.append({
             "id": rel(f),
             "label": short_label(f),
-            "folder": folder_of(f),
+            "type": "doc",
+            "module": folder_of(f),
             "orphan": f in orphan_set,
             "root": f in set(ENTRY_FILES),
             "incoming": incoming.get(f, 0),
         })
-    links = [{"source": rel(s), "target": rel(t)} for s, t in edges]
-    data = {"nodes": nodes, "links": links}
+    links = [{"source": rel(s), "target": rel(t), "kind": "doc"} for s, t in edges]
+
+    # --- md->code bridge: add code files as nodes + the citing links ---------
+    seen_code = set()
+
+    def add_code_node(node_id, label, broken):
+        if node_id in seen_code:
+            return
+        seen_code.add(node_id)
+        area = ("backend" if label.startswith("backend/") or "/backend/" in node_id
+                else "frontend" if label.startswith("frontend/") or "/frontend/" in node_id
+                else "other")
+        nodes.append({
+            "id": node_id, "label": os.path.basename(node_id.split(":", 1)[-1]),
+            "type": "code", "module": area, "broken": broken,
+            "orphan": False, "root": False, "incoming": 0,
+        })
+
+    for doc, code in code_edges:
+        cid = rel(code)
+        add_code_node(cid, cid, False)
+        links.append({"source": rel(doc), "target": cid, "kind": "code"})
+    for doc, raw in code_broken:
+        mid = "missing:" + raw            # raw doesn't resolve — keep distinct
+        add_code_node(mid, raw, True)
+        links.append({"source": rel(doc), "target": mid, "kind": "broken"})
+
+    modules = sorted({folder_of(f) for f in files})
+    data = {"nodes": nodes, "links": links, "modules": modules}
 
     html = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8"/>
@@ -394,79 +423,196 @@ def write_html(files, edges, orphans, unreachable, reachable, incoming):
 <title>docs/ai knowledge graph</title>
 <script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
 <style>
-  html,body{margin:0;height:100%;background:#0f172a;color:#e2e8f0;
+  html,body{margin:0;height:100%;background:#0f172a;color:#e2e8f0;overflow:hidden;
     font:13px/1.4 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
-  #hud{position:fixed;top:0;left:0;right:0;padding:10px 14px;z-index:10;
-    background:linear-gradient(#0f172af0,#0f172a00);display:flex;gap:18px;align-items:center;flex-wrap:wrap}
-  #hud h1{font-size:14px;margin:0;font-weight:700}
+  #hud{position:fixed;top:0;left:0;right:0;padding:9px 14px;z-index:10;
+    background:linear-gradient(#0f172af2,#0f172acc 70%,#0f172a00);
+    display:flex;gap:14px;align-items:center;flex-wrap:wrap}
+  #hud h1{font-size:14px;margin:0 6px 0 0;font-weight:700;white-space:nowrap}
   .stat{font-size:12px;color:#94a3b8}
   .stat b{color:#e2e8f0}
+  select,input,button{background:#1e293b;color:#e2e8f0;border:1px solid #334155;
+    border-radius:6px;padding:4px 8px;font:inherit;font-size:12px;outline:none}
+  select:focus,input:focus{border-color:#38bdf8}
+  button{cursor:pointer}
+  button:hover{background:#334155}
+  input{min-width:230px}
+  label.ctl{font-size:11px;color:#94a3b8;display:inline-flex;gap:5px;align-items:center}
   .pill{display:inline-flex;align-items:center;gap:5px;font-size:11px;color:#cbd5e1}
   .dot{width:9px;height:9px;border-radius:9px;display:inline-block}
+  .sq{width:9px;height:9px;display:inline-block}
   svg{width:100vw;height:100vh;display:block;cursor:grab}
-  .link{stroke:#334155;stroke-width:1.2px}
-  .node circle{stroke:#0f172a;stroke-width:1.5px;cursor:pointer}
+  .link{stroke:#334155;stroke-width:1.1px}
+  .link.code{stroke:#3f6212;stroke-dasharray:none}
+  .link.broken{stroke:#7f1d1d;stroke-dasharray:3 3}
+  .link.dim{stroke-opacity:.12}
   .node text{fill:#cbd5e1;font-size:10px;pointer-events:none}
   .node:hover text{fill:#fff;font-weight:600}
-  .hint{position:fixed;bottom:10px;left:14px;color:#64748b;font-size:11px}
+  .node.dim{opacity:.18}
+  .node .shape{stroke:#0f172a;stroke-width:1.5px;cursor:pointer}
+  #legend{position:fixed;bottom:10px;left:14px;display:flex;gap:14px;flex-wrap:wrap;
+    align-items:center;background:#0f172abb;padding:6px 10px;border-radius:8px}
+  #foot{position:fixed;bottom:10px;right:14px;color:#64748b;font-size:11px;text-align:right}
+  #foot b{color:#cbd5e1}
 </style></head>
 <body>
 <div id="hud">
-  <h1>docs/ai knowledge graph</h1>
-  <span class="stat"><b id="nf">0</b> files</span>
+  <h1>docs/ai graph</h1>
+  <label class="ctl">view
+    <select id="mode">
+      <option value="all">All md + code</option>
+      <option value="mdonly">All md only</option>
+      <option value="focus">Focus one md + its code</option>
+      <option value="module">Per-module subgraph</option>
+    </select>
+  </label>
+  <label class="ctl" id="modWrap" style="display:none">module
+    <select id="module"></select>
+  </label>
+  <input id="search" list="ids" placeholder="search a doc/file, Enter to focus…"/>
+  <datalist id="ids"></datalist>
+  <button id="reset">Reset</button>
+  <span class="stat"><b id="nf">0</b> nodes</span>
   <span class="stat"><b id="ne">0</b> links</span>
-  <span class="stat" style="color:#f87171"><b id="no">0</b> orphans</span>
-  <span class="pill"><span class="dot" style="background:#2dd4bf"></span>root</span>
-  <span class="pill"><span class="dot" style="background:#7dd3fc"></span>reachable</span>
-  <span class="pill"><span class="dot" style="background:#f87171"></span>orphan / unreachable</span>
+  <span class="stat" style="color:#f87171"><b id="no">0</b> broken</span>
 </div>
 <svg></svg>
-<div class="hint">drag to move · scroll to zoom · click a node to copy its path · node size = incoming links</div>
+<div id="legend">
+  <span class="pill"><span class="dot" style="background:#2dd4bf"></span>root doc</span>
+  <span class="pill"><span class="dot" style="background:#7dd3fc"></span>doc</span>
+  <span class="pill"><span class="dot" style="background:#f87171"></span>orphan doc</span>
+  <span class="pill"><span class="sq" style="background:#84cc16"></span>code file</span>
+  <span class="pill"><span class="sq" style="background:#ef4444;outline:1px dashed #ef4444"></span>missing code</span>
+</div>
+<div id="foot">drag node · scroll zoom · <b>click</b> node = focus + copy path</div>
 <script>
 const DATA = __DATA__;
-document.getElementById('nf').textContent = DATA.nodes.length;
-document.getElementById('ne').textContent = DATA.links.length;
-document.getElementById('no').textContent = DATA.nodes.filter(n=>n.orphan).length;
+const allNodes = DATA.nodes, allLinks = DATA.links;
+const byId = new Map(allNodes.map(n => [n.id, n]));
+
+// adjacency over RAW string ids (d3 later rewrites link.source/target to objects,
+// so we keep our own copy and hand d3 fresh link objects on every render).
+const nbr = new Map(allNodes.map(n => [n.id, []]));
+allLinks.forEach(l => { nbr.get(l.source).push({id:l.target, kind:l.kind, dir:"out"});
+                        nbr.get(l.target).push({id:l.source, kind:l.kind, dir:"in"}); });
+
+// datalist + module dropdown
+const ids = document.getElementById("ids");
+allNodes.filter(n=>n.type==="doc").forEach(n=>{ const o=document.createElement("option"); o.value=n.id; ids.appendChild(o); });
+const modSel = document.getElementById("module");
+DATA.modules.forEach(m=>{ const o=document.createElement("option"); o.value=m; o.textContent=m; modSel.appendChild(o); });
 
 const svg = d3.select("svg");
-const W = window.innerWidth, H = window.innerHeight;
+const W = () => window.innerWidth, H = () => window.innerHeight;
 const g = svg.append("g");
-svg.call(d3.zoom().scaleExtent([0.2,4]).on("zoom", e => g.attr("transform", e.transform)));
-
-const color = d3.scaleOrdinal(d3.schemeTableau10);
-function fill(n){ if(n.root) return "#2dd4bf"; if(n.orphan) return "#f87171"; return "#7dd3fc"; }
-function radius(n){ return n.root ? 11 : Math.min(4 + n.incoming*2.2, 16); }
-
-const sim = d3.forceSimulation(DATA.nodes)
-  .force("link", d3.forceLink(DATA.links).id(d=>d.id).distance(70).strength(0.6))
-  .force("charge", d3.forceManyBody().strength(-260))
-  .force("center", d3.forceCenter(W/2, H/2))
-  .force("collide", d3.forceCollide().radius(d=>radius(d)+14));
-
-const link = g.append("g").selectAll("line").data(DATA.links)
-  .join("line").attr("class","link").attr("marker-end","url(#arrow)");
-
+svg.call(d3.zoom().scaleExtent([0.15,4]).on("zoom", e => g.attr("transform", e.transform)));
 svg.append("defs").append("marker").attr("id","arrow").attr("viewBox","0 -5 10 10")
-  .attr("refX",18).attr("refY",0).attr("markerWidth",6).attr("markerHeight",6)
+  .attr("refX",16).attr("refY",0).attr("markerWidth",6).attr("markerHeight",6)
   .attr("orient","auto").append("path").attr("d","M0,-5L10,0L0,5").attr("fill","#475569");
 
-const node = g.append("g").selectAll("g").data(DATA.nodes)
-  .join("g").attr("class","node")
-  .call(d3.drag()
-    .on("start",(e,d)=>{if(!e.active)sim.alphaTarget(.3).restart();d.fx=d.x;d.fy=d.y;})
-    .on("drag",(e,d)=>{d.fx=e.x;d.fy=e.y;})
-    .on("end",(e,d)=>{if(!e.active)sim.alphaTarget(0);d.fx=null;d.fy=null;}));
+function fill(n){ if(n.type==="code") return n.broken ? "#ef4444" : "#84cc16";
+                  if(n.root) return "#2dd4bf"; if(n.orphan) return "#f87171"; return "#7dd3fc"; }
+function radius(n){ return n.root ? 11 : Math.min(4 + n.incoming*2.2, 15); }
 
-node.append("circle").attr("r",radius).attr("fill",fill);
-node.append("title").text(d=>d.id + "  (" + d.incoming + " incoming)");
-node.append("text").attr("x",d=>radius(d)+4).attr("y",3).text(d=>d.label);
-node.on("click",(e,d)=>{ navigator.clipboard?.writeText(d.id); });
+let sim, linkSel, nodeSel;
+const state = { mode:"all", module:DATA.modules[0]||"", focus:null };
 
-sim.on("tick",()=>{
-  link.attr("x1",d=>d.source.x).attr("y1",d=>d.source.y)
-      .attr("x2",d=>d.target.x).attr("y2",d=>d.target.y);
-  node.attr("transform",d=>`translate(${d.x},${d.y})`);
+// ---- which nodes/links are visible for the current state ----
+function visible(){
+  let keep;
+  if(state.mode==="mdonly"){
+    keep = new Set(allNodes.filter(n=>n.type==="doc").map(n=>n.id));
+  } else if(state.mode==="focus" && state.focus && byId.has(state.focus)){
+    keep = new Set([state.focus]);
+    nbr.get(state.focus).forEach(e=>{
+      if(e.kind==="doc") keep.add(e.id);                 // md neighbours (either dir)
+      else if(e.dir==="out") keep.add(e.id);             // code this doc cites
+    });
+  } else if(state.mode==="module"){
+    const docs = allNodes.filter(n=>n.type==="doc" && n.module===state.module).map(n=>n.id);
+    keep = new Set(docs);
+    docs.forEach(d => nbr.get(d).forEach(e=>{
+      if(e.dir==="out" && e.kind!=="doc") keep.add(e.id); // code cited by module docs
+      if(e.kind==="doc") keep.add(e.id);                  // 1-hop md neighbours (context)
+    }));
+  } else {
+    keep = new Set(allNodes.map(n=>n.id));               // all
+  }
+  const nodes = allNodes.filter(n=>keep.has(n.id));
+  const links = allLinks.filter(l=>keep.has(l.source) && keep.has(l.target))
+                        .map(l=>({source:l.source, target:l.target, kind:l.kind}));
+  return {nodes, links};
+}
+
+function render(){
+  const {nodes, links} = visible();
+  document.getElementById("nf").textContent = nodes.length;
+  document.getElementById("ne").textContent = links.length;
+  document.getElementById("no").textContent = nodes.filter(n=>n.type==="code"&&n.broken).length;
+
+  if(sim) sim.stop();
+  g.selectAll("g.layer").remove();
+  const lg = g.append("g").attr("class","layer");
+  const ng = g.append("g").attr("class","layer");
+
+  linkSel = lg.selectAll("line").data(links).join("line")
+    .attr("class",d=>"link "+d.kind).attr("marker-end","url(#arrow)");
+
+  nodeSel = ng.selectAll("g").data(nodes, d=>d.id).join("g").attr("class","node")
+    .call(d3.drag()
+      .on("start",(e,d)=>{if(!e.active)sim.alphaTarget(.3).restart();d.fx=d.x;d.fy=d.y;})
+      .on("drag",(e,d)=>{d.fx=e.x;d.fy=e.y;})
+      .on("end",(e,d)=>{if(!e.active)sim.alphaTarget(0);d.fx=null;d.fy=null;}));
+
+  nodeSel.each(function(d){
+    const s = d3.select(this);
+    if(d.type==="code"){
+      const z = d.broken ? 9 : 8;
+      s.append("rect").attr("class","shape").attr("width",z).attr("height",z)
+        .attr("x",-z/2).attr("y",-z/2).attr("rx",1.5).attr("fill",fill(d))
+        .attr("stroke-dasharray", d.broken ? "2 2" : null);
+    } else {
+      s.append("circle").attr("class","shape").attr("r",radius(d)).attr("fill",fill(d));
+    }
+  });
+  nodeSel.append("title").text(d=> d.type==="code"
+      ? (d.broken ? "MISSING — "+d.id.replace(/^missing:/,"") : d.id)
+      : d.id+"  ("+d.incoming+" incoming)");
+  nodeSel.append("text").attr("x",d=>(d.type==="code"?7:radius(d)+4)).attr("y",3).text(d=>d.label);
+  nodeSel.on("click",(e,d)=>{
+    if(d.type==="doc"){ state.focus=d.id; state.mode="focus"; syncControls(); render(); }
+    navigator.clipboard?.writeText(d.id.replace(/^missing:/,""));
+  });
+
+  sim = d3.forceSimulation(nodes)
+    .force("link", d3.forceLink(links).id(d=>d.id).distance(d=>d.kind==="doc"?80:46).strength(.55))
+    .force("charge", d3.forceManyBody().strength(-240))
+    .force("center", d3.forceCenter(W()/2, H()/2))
+    .force("collide", d3.forceCollide().radius(d=>(d.type==="code"?10:radius(d)+12)))
+    .on("tick",()=>{
+      linkSel.attr("x1",d=>d.source.x).attr("y1",d=>d.source.y)
+             .attr("x2",d=>d.target.x).attr("y2",d=>d.target.y);
+      nodeSel.attr("transform",d=>`translate(${d.x},${d.y})`);
+    });
+  sim.alpha(.9).restart();
+}
+
+function syncControls(){
+  document.getElementById("mode").value = state.mode;
+  document.getElementById("modWrap").style.display = state.mode==="module" ? "" : "none";
+  if(state.mode==="module") modSel.value = state.module;
+}
+
+document.getElementById("mode").addEventListener("change", e=>{ state.mode=e.target.value; syncControls(); render(); });
+modSel.addEventListener("change", e=>{ state.module=e.target.value; render(); });
+document.getElementById("search").addEventListener("change", e=>{
+  const v=e.target.value.trim(); if(byId.has(v)){ state.focus=v; state.mode="focus"; syncControls(); render(); }
 });
+document.getElementById("reset").addEventListener("click", ()=>{
+  state.mode="all"; state.focus=null; document.getElementById("search").value=""; syncControls(); render();
+});
+
+syncControls(); render();
 </script></body></html>"""
     html = html.replace("__DATA__", json.dumps(data))
     out = os.path.join(OUT_DIR, "doc_graph.html")
@@ -549,7 +695,8 @@ def main():
           f"(md->code bridge - informational; the hard gate is `rct verify`)")
     print(f"wrote: {rel(md)}")
     if not args.no_html:
-        html = write_html(files, edges, orphans, unreachable, reachable, incoming)
+        html = write_html(files, edges, orphans, unreachable, reachable, incoming,
+                           code_edges, code_broken)
         print(f"wrote: {rel(html)}")
 
     problems = set(orphans) | set(unreachable)
